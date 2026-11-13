@@ -87,7 +87,9 @@ jobs:
 
   test:
     needs: changes
+    # Forks without matching self-hosted runners can explicitly disable GPU CI.
     if: >
+      vars.QUACK_GPU_CI != 'false' &&
       needs.changes.outputs.code == 'true' &&
       (github.event_name == 'push' ||
        (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||

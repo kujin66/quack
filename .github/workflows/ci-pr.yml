@@ -6,6 +6,10 @@ on:
   pull_request_target:
     branches: [main]
 
+permissions:
+  contents: read
+  pull-requests: read
+
 concurrency:
   # github.ref is per-PR for pull_request events but collapses to refs/heads/main
   # for pull_request_target — keying on the PR number keeps both unique per PR.

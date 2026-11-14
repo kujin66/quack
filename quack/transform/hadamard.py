@@ -17,7 +17,11 @@ from cutlass import Boolean, Float32, Int32, const_expr
 from quack import copy_utils, layout_utils
 from quack.cache import jit_cache
 from quack.compile_utils import make_fake_tensor as fake_tensor
-from quack.cute_dsl_utils import get_device_multiprocessor_count, torch2cute_dtype_map
+from quack.cute_dsl_utils import (
+    get_device_capacity,
+    get_device_multiprocessor_count,
+    torch2cute_dtype_map,
+)
 from quack.dsl import cute_op
 
 
@@ -608,6 +612,48 @@ def exchange(
 # ─── Kernel object ──────────────────────────────────────────────────────────
 
 
+@cute.jit
+def exchange_half_smem(
+    vals: cute.Tensor,
+    smem: cute.Tensor,
+    tidx: Int32,
+    sync_fn,
+    bit_shift: cutlass.Constexpr[int],
+) -> cute.Tensor:
+    """The full value/thread transpose, staged through half the FP32 buffer.
+
+    Its highest address bit belongs to a value before the transpose and to
+    a thread after it. Store one half of each thread's original values, then
+    let the corresponding half of the threads read their complete result.
+    Original values stay in registers until both phases have consumed them.
+    """
+    ept = cute.size(vals)
+    assert bit_shift == int(math.log2(ept)), "Partial exchanges use the regular buffer"
+    threads = 2 * cute.size(smem) // ept
+    half_threads, half_ept = threads // 2, ept // 2
+    log_vecsize = min(2, bit_shift)
+    log_phase = min(5, bit_shift, int(math.log2(threads))) - log_vecsize
+    swizzle = cute.make_swizzle(log_phase, log_vecsize, bit_shift - log_vecsize)
+    store_layout = cute.make_composed_layout(swizzle, 0, cute.make_layout((threads, half_ept)))
+    load_layout = cute.make_composed_layout(
+        swizzle, 0, cute.make_layout((half_threads, ept), stride=(ept, 1))
+    )
+    store = cute.make_tensor(smem.iterator, store_layout)[tidx, None]
+    load = cute.make_tensor(smem.iterator, load_layout)[tidx % half_threads, None]
+    split_vals = cute.composition(vals, cute.make_layout((half_ept, 2)))
+    result = cute.make_rmem_tensor((ept,), Float32)
+    result.fill(0.0)
+    for phase in cutlass.range_constexpr(2):
+        if const_expr(phase > 0):
+            sync_fn()  # All phase-zero loads finish before the buffer is reused.
+        cute.autovec_copy(split_vals[None, phase], store)
+        sync_fn()
+        if tidx // half_threads == phase:
+            loaded = copy_utils.load_s2r(load).contiguous()
+            cute.autovec_copy(cute.composition(loaded, cute.make_layout((ept,))), result)
+    return cute.composition(result, cute.make_layout((ept, 1)))
+
+
 class HadamardTransform:
     """Hadamard kernel wrapper. Holds a `HadamardTransformPlan` and launches it."""
 
@@ -618,10 +664,20 @@ class HadamardTransform:
         ept: int | None = None,
         rows_per_block: int | None = None,
         persistent: bool = False,
+        smem_capacity: int | None = None,
     ):
         self.plan = HadamardTransformPlan(dtype, N, ept=ept, rows_per_block=rows_per_block)
         self.persistent = persistent
-        self.async_load = persistent
+        exchange_bytes = self.plan.N_padded * self.plan.rows_per_block * 4
+        self.half_exchange = smem_capacity is not None and exchange_bytes > smem_capacity
+        if self.half_exchange:
+            assert self.plan.N_padded == _MAX_N and self.plan.ept == 32
+            exchange_bytes //= 2
+            assert exchange_bytes <= smem_capacity, "Insufficient shared memory for Hadamard"
+        input_bytes = self.plan.N_padded * self.plan.rows_per_block * dtype.width // 8
+        self.async_load = persistent and (
+            smem_capacity is None or exchange_bytes + input_bytes <= smem_capacity
+        )
         self.use_shuffle = N <= 128  # slightly faster to use shuffles than smem for small N
         # print(self.plan)  # Uncomment to see the generated schedule and bit orders.
 
@@ -715,7 +771,11 @@ class HadamardTransform:
         copy = partial(copy_utils.copy, pred=tXpX)
 
         s_exchange_layout = cute.make_ordered_layout(
-            (plan.threads_per_transform * plan.ept, plan.rows_per_block), order=(0, 1)
+            (
+                plan.threads_per_transform * plan.ept // (2 if self.half_exchange else 1),
+                plan.rows_per_block,
+            ),
+            order=(0, 1),
         )
         s_exchange = None
         if const_expr(not self.use_shuffle):
@@ -769,7 +829,14 @@ class HadamardTransform:
                             # exchange loads to finish.  Warp-local exchange plans use a
                             # warp fence; cross-warp plans use a CTA barrier.
                             sync_fn()
-                        x_vals = exchange(x_vals, s_exchange, tidx, sync_fn, bit_shift=bit_shift)
+                        if const_expr(self.half_exchange):
+                            x_vals = exchange_half_smem(
+                                x_vals, s_exchange, tidx, sync_fn, bit_shift=bit_shift
+                            )
+                        else:
+                            x_vals = exchange(
+                                x_vals, s_exchange, tidx, sync_fn, bit_shift=bit_shift
+                            )
 
             if const_expr(not self.use_shuffle and plan.use_tail_direct_store):
                 tail_size = const_expr(1 << plan.tail_bit_shift)
@@ -801,13 +868,13 @@ class HadamardTransform:
 
     @staticmethod
     @jit_cache
-    def compile(dtype, N, persistent: bool = False):
+    def compile(dtype, N, persistent: bool = False, smem_capacity: int | None = None):
         batch_sym = cute.sym_int()
         div = math.gcd(N, 128 // dtype.width)
         x_cute = fake_tensor(dtype, (batch_sym, N), div)
         out_cute = fake_tensor(dtype, (batch_sym, N), div)
         return cute.compile(
-            HadamardTransform(dtype, N, persistent=persistent),
+            HadamardTransform(dtype, N, persistent=persistent, smem_capacity=smem_capacity),
             x_cute,
             out_cute,
             Float32(0.0),
@@ -837,7 +904,9 @@ def _hadamard_transform_fwd(x: Tensor, out: Tensor, scale: float) -> None:
     assert 2 <= N <= _MAX_N, f"Hadamard transform supports last dimension in [2, {_MAX_N}]"
     dtype = torch2cute_dtype_map[x.dtype]
     persistent = _should_use_persistent(x, N)
-    compiled = HadamardTransform.compile(dtype, N, persistent)
+    major, minor = get_device_capacity(x.device)
+    smem_capacity = cutlass.utils.get_smem_capacity_in_bytes(f"sm_{major}{minor}")
+    compiled = HadamardTransform.compile(dtype, N, persistent, smem_capacity)
     num_sms = _get_num_sms(x.device) if persistent else 0
     compiled(x, out, scale, num_sms)
 

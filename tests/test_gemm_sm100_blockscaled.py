@@ -26,8 +26,12 @@ from quack.sm100_utils import MmaKind
 from quack.blockscaled.quantize import to_blocked
 
 
-def _skip_if_not_sm100():
+def _skip_if_not_sm100(*, direct_sm100=False):
     major = torch.cuda.get_device_properties(0).major
+    if direct_sm100 and major not in (10, 11):
+        # Match the explicit architecture contract of the direct SM100
+        # compile helper; public quack.gemm paths below also support SM120.
+        pytest.skip("Direct SM100 GEMM compiler requires SM100/SM110")
     if major < 10:
         pytest.skip("SM100+ required")
 
@@ -44,6 +48,7 @@ def _compile_blockscaled_gemm(
     k,
     l,
 ):
+    _skip_if_not_sm100(direct_sm100=True)
     a_ref, mA = create_blockscaled_operand_tensor(l, m, k, False, ab_dtype)
     b_ref, mB = create_blockscaled_operand_tensor(l, n, k, False, ab_dtype)
     _, mD = create_blockscaled_operand_tensor(l, m, n, False, d_dtype, init="empty")
@@ -603,7 +608,7 @@ def test_scale_layout_matches_cublas(mn, sf_k, l):
     ],
 )
 def test_blockscaled_mxfp8_quantized(mma_tiler_mn, cluster_shape_mn, m, n, k):
-    _skip_if_not_sm100()
+    _skip_if_not_sm100(direct_sm100=True)
     l, sf_vec = 1, 32
 
     torch.manual_seed(0)
@@ -663,7 +668,7 @@ def test_blockscaled_mxfp8_quantized(mma_tiler_mn, cluster_shape_mn, m, n, k):
 def test_blockscaled_mxfp8_major_modes(a_major, b_major):
     """MXFP8 with A in {k,m}-major × B in {k,n}-major. The SF tensor layout
     stays K-major (hardware convention); only A/B operand strides differ."""
-    _skip_if_not_sm100()
+    _skip_if_not_sm100(direct_sm100=True)
     from quack.blockscaled.quantize import to_mx
 
     m, n, k, l = 256, 256, 256, 1
@@ -763,7 +768,7 @@ def test_blockscaled_varlen_m_nonaligned(seqlens_m, b_major, fmt):
     """varlen_m with per-expert seqlens not divisible by 128, plus k/n-major B.
     SFA is stored with tile-aligned per-batch padding; kernel reads it via
     offset_batch_SFA."""
-    _skip_if_not_sm100()
+    _skip_if_not_sm100(direct_sm100=True)
     if fmt != "mxfp8" and b_major == "n":
         pytest.skip("fp4 operands must be K-major")
     ab_dtype, sf_dtype, sf_vec = VARLEN_FMT[fmt]
@@ -836,7 +841,7 @@ def test_blockscaled_mxfp8_varlen_k(seqlens_k):
     ragged TMA's zero-filled value tail). SFA/SFB use tile-aligned per-batch K
     padding and the kernel reads them via offset_batch_SFA/offset_batch_SFB
     padded-K formula."""
-    _skip_if_not_sm100()
+    _skip_if_not_sm100(direct_sm100=True)
     num_experts = len(seqlens_k)
     m, n = 256, 256
     sf_vec = 32
@@ -1133,7 +1138,7 @@ def test_blockscaled_mxfp8_strided_sf(rk_pad):
     require the full scale tensor to be contig — only the innermost 512-B
     tile). Allocates a larger scale buffer with extra rk padding and slices
     back to the valid rk, producing a non-packed rm stride."""
-    _skip_if_not_sm100()
+    _skip_if_not_sm100(direct_sm100=True)
     m, n, k = 256, 256, 512  # k=512 → sf_k=16 → rk=4 (meaningful stride change)
     l, sf_vec = 1, 32
 

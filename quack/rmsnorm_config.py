@@ -119,15 +119,15 @@ class RmsNormBwdConfig:
         """Pick a launch config from the hand-tuned analytical heuristic.
 
         ``arch_major`` defaults to the current device's capability.
-        ``arch_major >= 10`` selects the Blackwell heuristic; anything else
-        uses the legacy/default path tuned on Hopper. ``num_acc`` is the
+        SM100/SM110 select the Blackwell heuristic; SM12x uses the
+        SMEM-aware SM12x branch in the legacy factory. ``num_acc`` is the
         number of persistent fp32 row accumulators the kernel carries
         (dw and/or db partials); it drives register-pressure decisions.
         For autotuning, use :func:`get_all_bwd_configs`.
         """
         if arch_major is None:
             arch_major = _detect_arch_major()
-        if arch_major >= 10:
+        if arch_major in (10, 11):
             return _for_blackwell_bwd(N, dtype_width, dout_width, T_hint, num_acc)
         return _for_hopper_bwd(N, dtype_width, arch_major)
 

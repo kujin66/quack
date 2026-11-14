@@ -820,6 +820,19 @@ def test_rmsnorm_bwd_tuned_config(num_threads, threads_per_row, cluster_n, reloa
         use_tma=False,
         smem_stages=2,
     )
+    # Explicit configs bypass the tuner. Four row tiles with two x/dout
+    # stages need 128 KB here, which cannot run on a 99 KB SM12x CTA.
+    rows_per_cta = config.num_threads // config.threads_per_row
+    tile_n = (N + config.cluster_n - 1) // config.cluster_n
+    data_smem_bytes = (
+        rows_per_cta * tile_n * config.smem_stages * (x.element_size() + dout.element_size())
+    )
+    smem_capacity = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+    if data_smem_bytes > smem_capacity:
+        pytest.skip(
+            f"Explicit config needs at least {data_smem_bytes} B shared memory; "
+            f"device supports {smem_capacity} B"
+        )
     rmsnorm_bwd_tuned.fn(
         x,
         weight,
